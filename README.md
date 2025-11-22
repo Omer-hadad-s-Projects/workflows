@@ -42,7 +42,7 @@ on:
 jobs:
   release:
     # ensure you reference the correct branch or tag (e.g., @master or @v1)
-    uses: Omer-hadad-s-Projects/workflows/.github/workflows/docker image builder.yaml@master 
+    uses: Omer-hadad-s-Projects/workflows/.github/workflows/docker-image-builder.yaml@master 
     with:
       # Required: The full image name (e.g., username/repo)
       image_name: your_dockerhub_username/your_image_name       
