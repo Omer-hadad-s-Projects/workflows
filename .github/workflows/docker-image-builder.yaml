@@ -1,0 +1,234 @@
+name: Release from changelog & build Docker
+
+on:
+  workflow_call:
+    inputs:
+      image_name:
+        description: "Docker image name, e.g. thetemani/speedtest"
+        required: true
+        type: string
+
+      default_branch:
+        description: "Default branch name for :latest tag"
+        required: false
+        type: string
+        default: main
+
+      changelog_path:
+        description: "Path to CHANGELOG file"
+        required: false
+        type: string
+        default: CHANGELOG.md
+
+      docker_context:
+        description: "Docker build context"
+        required: false
+        type: string
+        default: .
+
+    secrets:
+      DOCKERHUB_USERNAME:
+        required: true
+      DOCKERHUB_TOKEN:
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  IMAGE_NAME: ${{ inputs.image_name }}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  tag_from_changelog:
+    name: Create/ensure tag from CHANGELOG
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+      tag: ${{ steps.vars.outputs.tag }}
+      created: ${{ steps.ensure_tag.outputs.created }}
+    steps:
+      - name: Checkout (full history for tags)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure git identity
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Read version from CHANGELOG
+        id: ver
+        shell: bash
+        run: |
+          set -euo pipefail
+          CHANGELOG="${{ inputs.changelog_path }}"
+
+          if [ ! -f "$CHANGELOG" ]; then
+            echo "CHANGELOG file not found at: $CHANGELOG" >&2
+            exit 1
+          fi
+
+          VERSION="$(grep -Eom1 '^##[[:space:]]*\[?([0-9]+\.[0-9]+\.[0-9]+)\]?' "$CHANGELOG" | sed -E 's/^##[[:space:]]*\[?([0-9]+\.[0-9]+\.[0-9]+)\]?/\1/')"
+          if [ -z "$VERSION" ]; then
+            echo "Could not parse version from $CHANGELOG" >&2
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Make tag variables
+        id: vars
+        run: |
+          echo "tag=v${{ steps.ver.outputs.version }}" >> "$GITHUB_OUTPUT"
+
+      - name: Create tag if missing (push with token)
+        id: ensure_tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.vars.outputs.tag }}"
+
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            echo "Tag $TAG already exists. Skipping creation."
+            echo "created=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Creating tag $TAG"
+            git tag -a "$TAG" -m "Release $TAG"
+            git remote set-url origin "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}"
+            git push origin "$TAG"
+            echo "created=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  release:
+    name: Create GitHub Release with notes from CHANGELOG
+    runs-on: ubuntu-latest
+    needs: [ tag_from_changelog ]
+    steps:
+      - name: Checkout full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Extract release notes for this version from CHANGELOG
+        id: notes
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          CHANGELOG="${{ inputs.changelog_path }}"
+          VER="${{ needs.tag_from_changelog.outputs.version }}"
+          VEREsc="${VER//./\\.}"
+
+          if [ ! -f "$CHANGELOG" ]; then
+            echo "CHANGELOG file not found at: $CHANGELOG" >&2
+            exit 1
+          fi
+
+          # Keep a Changelog style: "## [VER] - yyyy-mm-dd"
+          sed -n "/^## \\[$VEREsc\\]/,/^## \\[/ { /^## \\[/!p }" "$CHANGELOG" > RELEASE_NOTES.md || true
+
+          # Fallback: "## VER" (no brackets)
+          if [ ! -s RELEASE_NOTES.md ]; then
+            sed -n "/^##[[:space:]]$VEREsc\\b/,/^##[[:space:]]/ { /^##[[:space:]]/!p }" "$CHANGELOG" > RELEASE_NOTES.md || true
+          fi
+
+          if [ ! -s RELEASE_NOTES.md ]; then
+            echo "Could not find section for version $VER in $CHANGELOG" >&2
+            exit 1
+          fi
+
+          # Trim trailing blanks
+          sed -Ez 's/\n+$/\n/' -i RELEASE_NOTES.md || true
+
+          echo "Prepared release notes for $VER:"
+          wc -c RELEASE_NOTES.md
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.tag_from_changelog.outputs.tag }}
+          name: v${{ needs.tag_from_changelog.outputs.version }}
+          body_path: RELEASE_NOTES.md
+
+  docker:
+    name: Build & push Docker image (X.Y.Z + latest)
+    runs-on: ubuntu-latest
+    needs: [ release, tag_from_changelog ]
+    steps:
+      - name: Checkout (with tags)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Compute Docker tags (only full semver + latest)
+        id: dockertags
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          CHANGELOG="${{ inputs.changelog_path }}"
+
+          # Prefer the version from the upstream job
+          VER="${{ needs.tag_from_changelog.outputs.version }}"
+
+          # Fallbacks for safety
+          if [[ -z "${VER}" && -f "$CHANGELOG" ]]; then
+            VER="$(grep -Eom1 '^##[[:space:]]*\[?([0-9]+\.[0-9]+\.[0-9]+)\]?' "$CHANGELOG" | sed -E 's/^##[[:space:]]*\[?([0-9]+\.[0-9]+\.[0-9]+)\]?/\1/')"
+          fi
+          if [[ -z "${VER}" ]]; then
+            VER="$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n1 | sed 's/^v//')"
+          fi
+
+          if [[ -z "${VER}" ]]; then
+            echo "::error::Empty version after all strategies. Ensure CHANGELOG has '## X.Y.Z' and the tag exists."
+            exit 1
+          fi
+          if [[ ! "${VER}" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+            echo "::error::Invalid version '${VER}'. Expected semver X.Y.Z"
+            exit 1
+          fi
+
+          # Start with just X.Y.Z
+          TAGS="${{ env.IMAGE_NAME }}:${VER}"
+
+          # Add latest only on default branch
+          if [[ "${GITHUB_REF}" == "refs/heads/${{ inputs.default_branch }}" ]]; then
+            TAGS=$(printf "%s\n%s\n" "$TAGS" "${{ env.IMAGE_NAME }}:latest")
+          fi
+
+          echo "Tags to push:"
+          echo "$TAGS" | sed 's/^/ - /'
+
+          {
+            echo "tags<<EOF"
+            echo "$TAGS"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build & push (multi-arch)
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.docker_context }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.dockertags.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
