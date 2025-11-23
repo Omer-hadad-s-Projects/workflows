@@ -39,6 +39,9 @@ on:
     branches:
       - master  # Trigger on pushes to your default branch
 
+permissions:
+  contents: write
+
 jobs:
   release:
     # ensure you reference the correct branch or tag (e.g., @master or @v1)
